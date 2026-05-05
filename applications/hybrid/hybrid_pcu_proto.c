@@ -25,6 +25,12 @@ static inline void put_u16_le(uint8_t *p, uint16_t v) {
 static inline uint16_t get_u16_le(const uint8_t *p) {
 	return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
 }
+static inline uint32_t get_u32_le(const uint8_t *p) {
+	return  (uint32_t)p[0]
+	     | ((uint32_t)p[1] <<  8)
+	     | ((uint32_t)p[2] << 16)
+	     | ((uint32_t)p[3] << 24);
+}
 
 hybrid_decode_t hybrid_proto_decode_curr_dem(const uint8_t *data, uint8_t len,
                                              hybrid_curr_dem_t *out) {
@@ -34,6 +40,28 @@ hybrid_decode_t hybrid_proto_decode_curr_dem(const uint8_t *data, uint8_t len,
 	out->I_rect_cmd_cA = (int16_t)get_u16_le(&data[0]);
 	out->mode          = (hybrid_mode_t)data[2];
 	out->seq           = data[3];
+	return HYBRID_DECODE_OK;
+}
+
+hybrid_decode_t hybrid_proto_decode_omega_dem(const uint8_t *data, uint8_t len,
+                                              hybrid_omega_dem_t *out) {
+	if (len != 8)                            return HYBRID_DECODE_BAD_LEN;
+	if (hybrid_crc8(data, 7) != data[7])     return HYBRID_DECODE_BAD_CRC;
+
+	out->omega_e_cmd_erpm = (int32_t)get_u32_le(&data[0]);
+	out->mode             = (hybrid_mode_t)data[4];
+	out->seq              = data[5];
+	return HYBRID_DECODE_OK;
+}
+
+hybrid_decode_t hybrid_proto_decode_duty_dem(const uint8_t *data, uint8_t len,
+                                             hybrid_duty_dem_t *out) {
+	if (len != 8)                            return HYBRID_DECODE_BAD_LEN;
+	if (hybrid_crc8(data, 7) != data[7])     return HYBRID_DECODE_BAD_CRC;
+
+	out->duty_cmd_x10000 = (int16_t)get_u16_le(&data[0]);
+	out->mode            = (hybrid_mode_t)data[2];
+	out->seq             = data[3];
 	return HYBRID_DECODE_OK;
 }
 

@@ -1,15 +1,20 @@
 /*
  * Hybrid PCU custom app — VESC acts as active rectifier on the engine bus.
- *   RX 0x101 (SendCurrDem)         @ ~200 Hz from PCU -> mc_interface_set_current()
+ *   RX 0x101 (SendCurrDem)         -> mc_interface_set_current()
+ *   RX 0x102 (SendOmegaDem)        -> mc_interface_set_pid_speed()  (eRPM -> mech RPM)
+ *   RX 0x103 (SendDutyDem)         -> mc_interface_set_duty()
  *   TX 0x201 (GetRectStateConcise) @ 10 Hz to PCU
  *
- * Wire format mirrors PCU's vesc_proto.c — see hybrid_pcu_proto.h.
- * Sign convention: I_rect_cmd_cA negative = regen (PMSG -> DC bus). PCU
- * already emits in VESC motor-frame, so we pass through without negating.
+ * The PCU emits exactly one of {0x101, 0x102, 0x103} at any time, picked by
+ * its rect_ctrl_mode. Last-write-wins on this side: each ID maps to a
+ * different mc_interface call, the most recent one wins. The single 50 ms
+ * RX watchdog covers all three — on stale, set_current(0) brings the motor
+ * back to a safe stop regardless of which mode was last active.
  *
- * Watchdog: belt-and-braces. timeout_reset() per valid frame keeps VESC's
- * own commands timeout fed; an explicit 50 ms check in the TX thread also
- * forces 0 A on stale RX.
+ * Wire format mirrors PCU's vesc_proto.c — see hybrid_pcu_proto.h.
+ *
+ * Sign convention (current): I_rect_cmd_cA negative = regen (PMSG -> DC bus).
+ * PCU emits in VESC motor-frame, so we pass through without negating.
  */
 #include "conf_general.h"
 
@@ -33,7 +38,18 @@
 
 #define HYBRID_TX_PERIOD_MS   100      /* 10 Hz state telemetry */
 #define HYBRID_RX_WD_MS       50       /* spec: 50 ms stale-cmd watchdog */
-#define HYBRID_I_MAX_A        60.0f    /* hardware-of-last-resort clamp */
+
+/* Hardware-of-last-resort clamps. Mirror powertrain_state.h. */
+#define HYBRID_I_MAX_A          60.0f      /*  60.00 A         */
+#define HYBRID_OMEGA_MAX_ERPM  100000.0f   /* 100k electrical RPM */
+#define HYBRID_DUTY_MAX         0.95f      /*  95.00 % duty    */
+
+typedef enum {
+	HYBRID_LAST_NONE    = 0,
+	HYBRID_LAST_CURRENT = 1,
+	HYBRID_LAST_OMEGA   = 2,
+	HYBRID_LAST_DUTY    = 3,
+} hybrid_last_ctrl_t;
 
 static THD_FUNCTION(hybrid_thread, arg);
 static THD_WORKING_AREA(hybrid_thread_wa, 1024);
@@ -45,17 +61,32 @@ static volatile systime_t last_rx_time = 0;
 static volatile bool      have_rx      = false;
 static volatile bool      rx_stale     = false;
 
-/* Diagnostic snapshot of the most recent valid 0x101 frame. Updated
- * inside the RX callback; read by the "hybrid_status" terminal cmd. */
-static volatile int16_t       last_I_cmd_cA = 0;
-static volatile uint8_t       last_mode     = 0;
-static volatile uint8_t       last_rx_seq   = 0;
-static volatile uint32_t      rx_count      = 0;
-static volatile uint32_t      rx_bad_count  = 0;
+/* Diagnostic snapshots — the most recent valid frame of each type. */
+static volatile hybrid_last_ctrl_t last_ctrl   = HYBRID_LAST_NONE;
+static volatile int16_t            last_I_cA      = 0;
+static volatile int32_t            last_omega_erpm = 0;
+static volatile int16_t            last_duty_x10000 = 0;
+static volatile uint8_t            last_mode    = 0;
+static volatile uint8_t            last_rx_seq  = 0;
+
+static volatile uint32_t           rx_count_curr  = 0;
+static volatile uint32_t           rx_count_omega = 0;
+static volatile uint32_t           rx_count_duty  = 0;
+static volatile uint32_t           rx_bad_count   = 0;
 
 static bool    hybrid_can_sid_rx(uint32_t id, uint8_t *data, uint8_t len);
 static uint8_t map_fault_bits(mc_fault_code f, bool stale);
 static void    terminal_hybrid_status(int argc, const char **argv);
+
+static inline void note_rx(uint8_t mode, uint8_t seq, hybrid_last_ctrl_t which) {
+	last_rx_time = chVTGetSystemTimeX();
+	last_mode    = mode;
+	last_rx_seq  = seq;
+	last_ctrl    = which;
+	have_rx      = true;
+	rx_stale     = false;
+	timeout_reset();
+}
 
 void app_custom_start(void) {
 	stop_now     = false;
@@ -88,44 +119,91 @@ void app_custom_configure(app_configuration *conf) {
 	(void)conf;
 }
 
+/* eRPM -> mechanical RPM via VESC's configured motor pole count.
+ * mc_interface_set_pid_speed expects mechanical RPM. */
+static float erpm_to_mech_rpm(int32_t erpm) {
+	const volatile mc_configuration *mcc = mc_interface_get_configuration();
+	float poles = (mcc != 0) ? (float)mcc->si_motor_poles : 2.0f;
+	if (poles < 2.0f) poles = 2.0f;          /* 2 poles = 1 pole-pair minimum */
+	const float pole_pairs = poles * 0.5f;
+	return (float)erpm / pole_pairs;
+}
+
 /* CAN RX callback — runs in comm_can dispatch thread context.
  * Return true so VESC core/LispBM skip further processing of these IDs. */
 static bool hybrid_can_sid_rx(uint32_t id, uint8_t *data, uint8_t len) {
-	if (id != HYBRID_ID_SEND_CURR_DEM) {
+	switch (id) {
+	case HYBRID_ID_SEND_CURR_DEM: {
+		hybrid_curr_dem_t cmd;
+		if (hybrid_proto_decode_curr_dem(data, len, &cmd) != HYBRID_DECODE_OK) {
+			rx_bad_count++;
+			return true;
+		}
+		float i_a = (float)cmd.I_rect_cmd_cA * 0.01f;
+		utils_truncate_number(&i_a, -HYBRID_I_MAX_A, HYBRID_I_MAX_A);
+		mc_interface_set_current(i_a);
+		last_I_cA = cmd.I_rect_cmd_cA;
+		rx_count_curr++;
+		note_rx((uint8_t)cmd.mode, cmd.seq, HYBRID_LAST_CURRENT);
+		return true;
+	}
+	case HYBRID_ID_SEND_OMEGA_DEM: {
+		hybrid_omega_dem_t cmd;
+		if (hybrid_proto_decode_omega_dem(data, len, &cmd) != HYBRID_DECODE_OK) {
+			rx_bad_count++;
+			return true;
+		}
+		float erpm_f = (float)cmd.omega_e_cmd_erpm;
+		utils_truncate_number(&erpm_f, -HYBRID_OMEGA_MAX_ERPM, HYBRID_OMEGA_MAX_ERPM);
+		mc_interface_set_pid_speed(erpm_to_mech_rpm((int32_t)erpm_f));
+		last_omega_erpm = cmd.omega_e_cmd_erpm;
+		rx_count_omega++;
+		note_rx((uint8_t)cmd.mode, cmd.seq, HYBRID_LAST_OMEGA);
+		return true;
+	}
+	case HYBRID_ID_SEND_DUTY_DEM: {
+		hybrid_duty_dem_t cmd;
+		if (hybrid_proto_decode_duty_dem(data, len, &cmd) != HYBRID_DECODE_OK) {
+			rx_bad_count++;
+			return true;
+		}
+		float duty = (float)cmd.duty_cmd_x10000 * 0.0001f;
+		utils_truncate_number(&duty, -HYBRID_DUTY_MAX, HYBRID_DUTY_MAX);
+		mc_interface_set_duty(duty);
+		last_duty_x10000 = cmd.duty_cmd_x10000;
+		rx_count_duty++;
+		note_rx((uint8_t)cmd.mode, cmd.seq, HYBRID_LAST_DUTY);
+		return true;
+	}
+	default:
 		return false;
 	}
-
-	hybrid_curr_dem_t cmd;
-	if (hybrid_proto_decode_curr_dem(data, len, &cmd) != HYBRID_DECODE_OK) {
-		rx_bad_count++;
-		return true; /* swallow malformed 0x101 anyway */
-	}
-
-	float i_a = (float)cmd.I_rect_cmd_cA * 0.01f;
-	utils_truncate_number(&i_a, -HYBRID_I_MAX_A, HYBRID_I_MAX_A);
-
-	mc_interface_set_current(i_a);
-	timeout_reset();
-
-	last_rx_time  = chVTGetSystemTimeX();
-	last_I_cmd_cA = cmd.I_rect_cmd_cA;
-	last_mode     = (uint8_t)cmd.mode;
-	last_rx_seq   = cmd.seq;
-	rx_count++;
-	have_rx       = true;
-	rx_stale      = false;
-	return true;
 }
 
 /* "hybrid_status" terminal command — type it in VESC Tool's Terminal tab. */
 static void terminal_hybrid_status(int argc, const char **argv) {
 	(void)argc; (void)argv;
 	uint32_t age_ms = have_rx ? ST2MS(chVTTimeElapsedSinceX(last_rx_time)) : 0;
+	const char *ctrl_name = "NONE";
+	switch (last_ctrl) {
+	case HYBRID_LAST_CURRENT: ctrl_name = "CURRENT"; break;
+	case HYBRID_LAST_OMEGA:   ctrl_name = "OMEGA";   break;
+	case HYBRID_LAST_DUTY:    ctrl_name = "DUTY";    break;
+	default: break;
+	}
 	commands_printf("hybrid PCU link:");
-	commands_printf("  RX frames OK:   %lu", (unsigned long)rx_count);
+	commands_printf("  RX OK curr/omega/duty: %lu / %lu / %lu",
+			(unsigned long)rx_count_curr,
+			(unsigned long)rx_count_omega,
+			(unsigned long)rx_count_duty);
 	commands_printf("  RX frames bad:  %lu", (unsigned long)rx_bad_count);
-	commands_printf("  last I_cmd:     %d cA  (%.2f A)",
-			(int)last_I_cmd_cA, (double)last_I_cmd_cA * 0.01);
+	commands_printf("  active control: %s", ctrl_name);
+	commands_printf("  last I_cmd:     %d cA   (%.2f A)",
+			(int)last_I_cA, (double)last_I_cA * 0.01);
+	commands_printf("  last omega:     %ld eRPM",
+			(long)last_omega_erpm);
+	commands_printf("  last duty:      %d /10000 (%.2f %%)",
+			(int)last_duty_x10000, (double)last_duty_x10000 * 0.01);
 	commands_printf("  last mode:      %u", (unsigned)last_mode);
 	commands_printf("  last seq:       %u", (unsigned)last_rx_seq);
 	commands_printf("  age:            %lu ms %s",
@@ -148,7 +226,8 @@ static THD_FUNCTION(hybrid_thread, arg) {
 			return;
 		}
 
-		/* Stale-RX watchdog */
+		/* Stale-RX watchdog — covers all three setpoint frame types.
+		 * set_current(0) is safe regardless of which mode was active. */
 		if (have_rx &&
 		    ST2MS(chVTTimeElapsedSinceX(last_rx_time)) > HYBRID_RX_WD_MS) {
 			mc_interface_set_current(0.0f);
