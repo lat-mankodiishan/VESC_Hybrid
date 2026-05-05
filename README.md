@@ -1,148 +1,96 @@
-# VESC firmware
+# VESC_Hybrid
 
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
-[![Travis CI Status](https://travis-ci.com/vedderb/bldc.svg?branch=master)](https://travis-ci.com/vedderb/bldc)
-[![Codacy Badge](https://api.codacy.com/project/badge/Grade/75e90ffbd46841a3a7be2a9f7a94c242)](https://www.codacy.com/app/vedderb/bldc?utm_source=github.com&amp;utm_medium=referral&amp;utm_content=vedderb/bldc&amp;utm_campaign=Badge_Grade)
-[![Contributors](https://img.shields.io/github/contributors/vedderb/bldc.svg)](https://github.com/vedderb/bldc/graphs/contributors)
-[![Watchers](https://img.shields.io/github/watchers/vedderb/bldc.svg)](https://github.com/vedderb/bldc/watchers)
-[![Stars](https://img.shields.io/github/stars/vedderb/bldc.svg)](https://github.com/vedderb/bldc/stargazers)
-[![Forks](https://img.shields.io/github/forks/vedderb/bldc.svg)](https://github.com/vedderb/bldc/network/members)
+Custom VESC firmware for the LAT series-hybrid EGU. The VESC acts as the active
+rectifier on the engine bus: takes current / speed / duty setpoints from the PCU
+over CAN, broadcasts rectifier state back, with a 50 ms watchdog that pulls
+current to zero on link loss.
 
-An open source motor controller firmware.
+Custom code lives entirely in **[applications/hybrid/](applications/hybrid/)**
+plus two one-line wires into the rest of the tree.
 
-This is the source code for the VESC DC/BLDC/FOC controller. Read more at
-[https://vesc-project.com/](https://vesc-project.com/)
+## File-by-file
 
-## Supported boards
+### [hybrid_pcu_proto.h](applications/hybrid/hybrid_pcu_proto.h) / [.c](applications/hybrid/hybrid_pcu_proto.c) — wire format
 
-All of them!
+Pure framing/CRC code, no HAL or VESC dependencies. Mirrors the PCU's
+`vesc_proto.c` byte-for-byte (cross-board contract).
 
-Check the supported boards by typing `make`
+- `hybrid_crc8()` — CRC-8/SMBUS (poly 0x07, init 0x00, no reflection).
+- `hybrid_proto_decode_curr_dem()` → unpacks **0x101** `(I_cA int16, mode, seq)`.
+- `hybrid_proto_decode_omega_dem()` → unpacks **0x102** `(omega_e_erpm int32, mode, seq)`.
+- `hybrid_proto_decode_duty_dem()` → unpacks **0x103** `(duty_x10000 int16, mode, seq)`.
+- `hybrid_proto_encode_rect_state_concise()` → packs **0x201**
+  `(V_dc, I_dc, gen_rpm, igbt_temp, fault_bits, seq)`.
+
+All multi-byte fields little-endian. CRC over bytes 0..6, byte 7 = CRC.
+
+### [hybrid_pcu.c](applications/hybrid/hybrid_pcu.c) — the actual app
+
+Three jobs:
+
+**1. RX dispatcher.** `hybrid_can_sid_rx()` is registered via
+`comm_can_set_sid_rx_callback`. Switches on the CAN ID and routes:
+- 0x101 → `mc_interface_set_current(I_A)` after ±60 A clamp.
+- 0x102 → `mc_interface_set_pid_speed(eRPM / pole_pairs)` — pole pairs read live
+  from `mc_configuration.si_motor_poles / 2`.
+- 0x103 → `mc_interface_set_duty(duty)` after ±0.95 clamp.
+
+Each path resets the watchdog (`timeout_reset()` + `last_rx_time`) and bumps a
+per-mode counter. Returns `true` so VESC core / LispBM ignore the frame.
+
+**2. 10 Hz state TX.** `hybrid_thread` (ChibiOS thread, NORMALPRIO) runs the
+loop:
+- Watchdog: if no valid RX in 50 ms → `mc_interface_set_current(0)` and set
+  `rx_stale=true`.
+- Read `V_dc`, `I_dc`, `RPM`, `T_fet` from `mc_interface`.
+- Pack into `hybrid_rect_state_t`, encode, transmit `0x201` via
+  `comm_can_transmit_sid`.
+- `fault_bits[3:0]` mapped from `mc_interface_get_fault()`: bit0=OV, bit1=OC,
+  bit2=OT (FET∨motor), bit3=DRV/UV/STALE.
+
+**3. Terminal diagnostic.** `hybrid_status` command (registered via
+`terminal_register_command_callback`) prints to VESC Tool's Terminal:
+- Per-mode RX OK counters (curr / omega / duty)
+- Bad-frame count (CRC / length failures)
+- Active control type (whichever ID was last received)
+- Last decoded I / omega / duty values
+- Last `mode`, `seq`, frame age, current `mc_fault_code`, STALE flag
+
+### [hybrid_pcu_conf.h](applications/hybrid/hybrid_pcu_conf.h) — build-time config
+
+- `APP_CUSTOM_TO_USE "hybrid/hybrid_pcu.c"` → tells `app_custom.c` to `#include`
+  our app.
+- `APPCONF_APP_TO_USE = APP_CUSTOM` → bakes "use custom app" into firmware
+  defaults so a mass-erased unit boots ready (no VESC Tool config write needed).
+- `APPCONF_CAN_BAUD_RATE = CAN_BAUD_500K` → 500k engine bus to coexist with
+  Loweheiser ECU.
+
+## Wires into the rest of the tree (only two lines)
+
+- [conf_general.h](conf_general.h) — `#include "hybrid/hybrid_pcu_conf.h"`.
+  Activates the custom app slot.
+- [applications/applications.mk](applications/applications.mk) — adds
+  `hybrid/hybrid_pcu_proto.c` to `APPSRC` and `applications/hybrid` to `APPINC`.
+  (`hybrid_pcu.c` is *not* in APPSRC — it's pulled in via
+  `#include APP_CUSTOM_TO_USE` from `app_custom.c`. Adding it would
+  double-define.)
+
+## In one sentence
+
+VESC firmware pretends to be a current / speed / duty-controlled active
+rectifier with a 10 Hz heartbeat back to the PCU and a 50 ms safety watchdog —
+everything else is stock VESC.
+
+## Build target
+
+Target hardware: Trampa VESC 6 MK5 (`HW_NAME = "60_MK5"`).
 
 ```
-[Firmware]
-     fw   - Build firmware for default target
-                            supported boards are: 100_250 100_250_no_limits 100_500...
+make fw_60_mk5
 ```
 
-There are also many other options that can be changed in [conf_general.h](conf_general.h).
+Produces `build/60_mk5/60_mk5.hex`. Flash via SWD with STM32CubeProgrammer or
+the bundled `make fw_60_mk5_flash` (needs OpenOCD on PATH).
 
-## Prerequisites
-
-### On Ubuntu (Linux)/macOS
-- Tools: `git`, `wget`, and `make`
-- Additional Linux requirements: `libgl-dev` and `libxcb-xinerama0`
-- Helpful Ubuntu commands:
-```bash
-sudo apt install git build-essential libgl-dev libxcb-xinerama0 wget git-gui
-```
-- Helpful macOS tools: 
-
-```bash
-brew install stlink
-brew install openocd
-```
-
-### On Windows
-- Chocolately: https://chocolatey.org/install
-- Git: https://git-scm.com/download/win. Make sure to click any boxes to add Git to your Environment (aka PATH)
-
-## Install Dev environment and build
-
-### On Ubuntu (Linux)/MacOS
-Open up a terminal
-1.  `git clone http://github.com/vedderb/bldc.git`
-2.  `cd bldc`
-3.  Continue with [On all platforms](#on-all-platforms)
-
-### On Windows
-
-1.  Open up a Windows Powershell terminal (Resist the urge to run Powershell as administrator, that will break things)
-2.  Type `choco install make`
-3.  `git clone http://github.com/vedderb/bldc`
-4.  `cd bldc`
-5.  Continue with [On all platforms](#on-all-platforms)
-
-### On all platforms
-
-1.  `git checkout origin/master`
-2.  `make arm_sdk_install`
-3.  `make` <-- Pick out the name of your target device from the supported boards list. For instance, I have a Trampa **VESC 100/250**, so my target is `100_250`
-4.   `make 100_250` <-- This will build the **VESC 100/250** firmware and place it into the `bldc/builds/100_250/` directory
-
-## Other tools
-
-**Linux Optional - Add udev rules to use the stlink v2 programmer without being root**
-```bash
-wget vedder.se/Temp/49-stlinkv2.rules
-sudo mv 49-stlinkv2.rules /etc/udev/rules.d/
-sudo udevadm trigger
-```
-
-## IDE
-### Prerequisites
-#### On macOS/Linux
-
-- `python3`, and `pip`
-
-#### On Windows
-- Python 3: https://www.python.org/downloads/. Make sure to click the box to add Python3 to your Environment.
-
-### All platforms
-
-1.  `pip install aqtinstall`
-2.  `make qt_install`
-3.  Open Qt Creator IDE installed in `tools/Qt/Tools/QtCreator/bin/qtcreator`
-4.  With Qt Creator, open the vesc firmware Qt Creator project, named vesc.pro. You will find it in `Project/Qt Creator/vesc.pro`
-5.  The IDE is configured by default to build 100_250 firmware, this can be changed in the bottom of the left panel, there you will find all hardware variants supported by VESC
-
-## Upload to VESC
-### Method 1 - Flash it using an STLink SWD debugger
-
-1.  Build and flash the [bootloader](https://github.com/vedderb/bldc-bootloader) first
-2.  Then `_flash` to the target of your choice. So for instance, for the VESC 100/250: 
-```bash
-make 100_250_flash
-```
-
-### Method 2 - Upload Firmware via VESC tool through USB
-
-1.  Clone and build the firmware in **.bin** format as in the above Build instructions
-
-In VESC tool
-
-2.  Connect to the VESC
-3.  Navigate to the Firmware tab on the left side menu 
-4.  Click on Custom file tab
-5.  Click on the folder icon to select the built firmware in .bin format (e.g. `build/100_250/100_250.bin`)
-
-##### [ Reminder : It is normal to see VESC disconnects during the firmware upload process ]  
-#####  **[ Warning : DO NOT DISCONNECT POWER/USB to VESC during the upload process, or you will risk bricking your VESC ]**  
-#####  **[ Warning : ONLY DISCONNECT your VESC 10s after the upload loading bar completed and "FW Upload DONE" ]**
-
-6.  Press the upload firmware button (downward arrow) on the bottom right to start upload the selected firmware.
-7.  Wait for **10s** after the loading bar completed (Warning: unplug sooner will risk bricking your VESC)
-8.  The VESC will disconnect itself after new firmware is uploaded.
-
-## In case you bricked your VESC
-you will need to upload a new working firmware to the VESC.  
-However, to upload a firmware to a bricked VESC, you have to use a SWD Debugger.
-
-
-## Contribute
-
-Head to the [forums](https://vesc-project.com/forum) to get involved and improve this project.
-Join the [Discord](https://discord.gg/JgvV5NwYts) for real-time support and chat
-
-## Tags
-
-Every firmware release has a tag. They are created as follows:
-
-```bash
-git tag -a [version] [commit] -m "VESC Firmware Version [version]"
-git push --tags
-```
-
-## License
-
-The software is released under the GNU General Public License version 3.0
+Upstream Vedder firmware is preserved as the `upstream` git remote — pull
+updates via `git fetch upstream && git merge upstream/master`.

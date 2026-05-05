@@ -199,11 +199,12 @@ static void terminal_hybrid_status(int argc, const char **argv) {
 	commands_printf("  RX frames bad:  %lu", (unsigned long)rx_bad_count);
 	commands_printf("  active control: %s", ctrl_name);
 	commands_printf("  last I_cmd:     %d cA   (%.2f A)",
-			(int)last_I_cA, (double)last_I_cA * 0.01);
+			(int)last_I_cA, (double)((float)last_I_cA * 0.01f));
 	commands_printf("  last omega:     %ld eRPM",
 			(long)last_omega_erpm);
 	commands_printf("  last duty:      %d /10000 (%.2f %%)",
-			(int)last_duty_x10000, (double)last_duty_x10000 * 0.01);
+			(int)last_duty_x10000,
+			(double)((float)last_duty_x10000 * 0.01f));
 	commands_printf("  last mode:      %u", (unsigned)last_mode);
 	commands_printf("  last seq:       %u", (unsigned)last_rx_seq);
 	commands_printf("  age:            %lu ms %s",
