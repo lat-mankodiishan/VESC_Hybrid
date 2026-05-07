@@ -29,6 +29,7 @@
 #include "utils_math.h"
 #include "terminal.h"
 #include "commands.h"
+#include "mempools.h"
 
 #include "hybrid_pcu_proto.h"
 
@@ -69,10 +70,13 @@ static volatile int16_t            last_duty_x10000 = 0;
 static volatile uint8_t            last_mode    = 0;
 static volatile uint8_t            last_rx_seq  = 0;
 
-static volatile uint32_t           rx_count_curr  = 0;
-static volatile uint32_t           rx_count_omega = 0;
-static volatile uint32_t           rx_count_duty  = 0;
-static volatile uint32_t           rx_bad_count   = 0;
+static volatile uint32_t           rx_count_curr        = 0;
+static volatile uint32_t           rx_count_omega       = 0;
+static volatile uint32_t           rx_count_duty        = 0;
+static volatile uint32_t           rx_count_motor_type  = 0;
+static volatile uint32_t           motor_type_changes   = 0;
+static volatile uint8_t            last_motor_type_seen = 0xFF;
+static volatile uint32_t           rx_bad_count         = 0;
 
 static bool    hybrid_can_sid_rx(uint32_t id, uint8_t *data, uint8_t len);
 static uint8_t map_fault_bits(mc_fault_code f, bool stale);
@@ -119,15 +123,11 @@ void app_custom_configure(app_configuration *conf) {
 	(void)conf;
 }
 
-/* eRPM -> mechanical RPM via VESC's configured motor pole count.
- * mc_interface_set_pid_speed expects mechanical RPM. */
-static float erpm_to_mech_rpm(int32_t erpm) {
-	const volatile mc_configuration *mcc = mc_interface_get_configuration();
-	float poles = (mcc != 0) ? (float)mcc->si_motor_poles : 2.0f;
-	if (poles < 2.0f) poles = 2.0f;          /* 2 poles = 1 pole-pair minimum */
-	const float pole_pairs = poles * 0.5f;
-	return (float)erpm / pole_pairs;
-}
+/* mc_interface_set_pid_speed in this firmware version takes ELECTRICAL RPM
+ * directly (the FOC speed PID compares against mcpwm_foc_get_rpm which
+ * returns RADPS2RPM_f(m_pll_speed) — electrical). So we pass eRPM through
+ * with no conversion. Earlier (pre-7.x) versions wanted mech RPM; if you
+ * roll bldc back, reinstate erpm/pole_pairs here. */
 
 /* CAN RX callback — runs in comm_can dispatch thread context.
  * Return true so VESC core/LispBM skip further processing of these IDs. */
@@ -155,7 +155,7 @@ static bool hybrid_can_sid_rx(uint32_t id, uint8_t *data, uint8_t len) {
 		}
 		float erpm_f = (float)cmd.omega_e_cmd_erpm;
 		utils_truncate_number(&erpm_f, -HYBRID_OMEGA_MAX_ERPM, HYBRID_OMEGA_MAX_ERPM);
-		mc_interface_set_pid_speed(erpm_to_mech_rpm((int32_t)erpm_f));
+		mc_interface_set_pid_speed(erpm_f);     /* takes eRPM directly */
 		last_omega_erpm = cmd.omega_e_cmd_erpm;
 		rx_count_omega++;
 		note_rx((uint8_t)cmd.mode, cmd.seq, HYBRID_LAST_OMEGA);
@@ -175,6 +175,45 @@ static bool hybrid_can_sid_rx(uint32_t id, uint8_t *data, uint8_t len) {
 		note_rx((uint8_t)cmd.mode, cmd.seq, HYBRID_LAST_DUTY);
 		return true;
 	}
+	case HYBRID_ID_SEND_MOTOR_TYPE_CMD: {
+		/* Configuration command, not a setpoint. Does NOT feed the
+		 * setpoint watchdog (note_rx) — if PCU stops sending 0x101/2/3
+		 * but keeps 0x104 alive, we still want set_current(0) to fire. */
+		hybrid_motor_type_cmd_t cmd;
+		if (hybrid_proto_decode_motor_type_cmd(data, len, &cmd) != HYBRID_DECODE_OK) {
+			rx_bad_count++;
+			return true;
+		}
+		rx_count_motor_type++;
+		last_motor_type_seen = (uint8_t)cmd.motor_type;
+
+		/* Translate to mc_motor_type. Same numeric values today, but be
+		 * explicit so a future renumber on either side is caught. */
+		mc_motor_type new_type;
+		switch (cmd.motor_type) {
+		case HYBRID_MOTOR_TYPE_BLDC: new_type = MOTOR_TYPE_BLDC; break;
+		case HYBRID_MOTOR_TYPE_DC:   new_type = MOTOR_TYPE_DC;   break;
+		case HYBRID_MOTOR_TYPE_FOC:  new_type = MOTOR_TYPE_FOC;  break;
+		/* HYBRID_MOTOR_TYPE_GPD reserved in protocol but not supported by
+		 * this bldc version — datatypes.h has only BLDC/DC/FOC. */
+		default: return true;          /* unknown / unsupported — ignore */
+		}
+
+		/* Dedup: skip the reconfig if motor_type already matches. PCU sends
+		 * this at ~1 Hz keep-alive plus on every change, so most invocations
+		 * are no-ops. set_configuration re-inits the motor stage and is
+		 * expensive — never call unconditionally. */
+		const volatile mc_configuration *cur = mc_interface_get_configuration();
+		if (cur->motor_type != new_type) {
+			mc_configuration *mcconf = mempools_alloc_mcconf();
+			*mcconf = *cur;                   /* copy current full config */
+			mcconf->motor_type = new_type;
+			mc_interface_set_configuration(mcconf);
+			mempools_free_mcconf(mcconf);
+			motor_type_changes++;
+		}
+		return true;
+	}
 	default:
 		return false;
 	}
@@ -191,12 +230,25 @@ static void terminal_hybrid_status(int argc, const char **argv) {
 	case HYBRID_LAST_DUTY:    ctrl_name = "DUTY";    break;
 	default: break;
 	}
+	const char *mt_name = "?";
+	const volatile mc_configuration *mcc = mc_interface_get_configuration();
+	switch (mcc->motor_type) {
+	case MOTOR_TYPE_BLDC: mt_name = "BLDC"; break;
+	case MOTOR_TYPE_DC:   mt_name = "DC";   break;
+	case MOTOR_TYPE_FOC:  mt_name = "FOC";  break;
+	default: break;
+	}
+
 	commands_printf("hybrid PCU link:");
-	commands_printf("  RX OK curr/omega/duty: %lu / %lu / %lu",
+	commands_printf("  RX OK curr/omega/duty/mt: %lu / %lu / %lu / %lu",
 			(unsigned long)rx_count_curr,
 			(unsigned long)rx_count_omega,
-			(unsigned long)rx_count_duty);
+			(unsigned long)rx_count_duty,
+			(unsigned long)rx_count_motor_type);
 	commands_printf("  RX frames bad:  %lu", (unsigned long)rx_bad_count);
+	commands_printf("  motor_type now: %s   (last cmd raw: %u, changes: %lu)",
+			mt_name, (unsigned)last_motor_type_seen,
+			(unsigned long)motor_type_changes);
 	commands_printf("  active control: %s", ctrl_name);
 	commands_printf("  last I_cmd:     %d cA   (%.2f A)",
 			(int)last_I_cA, (double)((float)last_I_cA * 0.01f));

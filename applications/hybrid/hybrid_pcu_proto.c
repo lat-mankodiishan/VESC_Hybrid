@@ -65,6 +65,17 @@ hybrid_decode_t hybrid_proto_decode_duty_dem(const uint8_t *data, uint8_t len,
 	return HYBRID_DECODE_OK;
 }
 
+hybrid_decode_t hybrid_proto_decode_motor_type_cmd(const uint8_t *data, uint8_t len,
+                                                   hybrid_motor_type_cmd_t *out) {
+	if (len != 8)                            return HYBRID_DECODE_BAD_LEN;
+	if (hybrid_crc8(data, 7) != data[7])     return HYBRID_DECODE_BAD_CRC;
+
+	out->motor_type = (hybrid_motor_type_t)data[0];
+	out->mode       = (hybrid_mode_t)data[1];
+	out->seq        = data[2];
+	return HYBRID_DECODE_OK;
+}
+
 void hybrid_proto_encode_rect_state_concise(const hybrid_rect_state_t *in,
                                             uint8_t out8[8]) {
 	memset(out8, 0, 8);

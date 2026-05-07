@@ -12,7 +12,16 @@
 #define HYBRID_ID_SEND_CURR_DEM           0x101u
 #define HYBRID_ID_SEND_OMEGA_DEM          0x102u
 #define HYBRID_ID_SEND_DUTY_DEM           0x103u
+#define HYBRID_ID_SEND_MOTOR_TYPE_CMD     0x104u
 #define HYBRID_ID_GET_RECT_STATE_CONCISE  0x201u
+
+/* Mirrors VESC's mc_motor_type — same numeric values. */
+typedef enum {
+	HYBRID_MOTOR_TYPE_BLDC = 0,
+	HYBRID_MOTOR_TYPE_DC   = 1,
+	HYBRID_MOTOR_TYPE_FOC  = 2,
+	HYBRID_MOTOR_TYPE_GPD  = 3,
+} hybrid_motor_type_t;
 
 typedef enum {
 	HYBRID_MODE_IDLE    = 0,
@@ -42,6 +51,12 @@ typedef struct {
 } hybrid_duty_dem_t;
 
 typedef struct {
+	hybrid_motor_type_t motor_type;
+	hybrid_mode_t       mode;
+	uint8_t             seq;
+} hybrid_motor_type_cmd_t;
+
+typedef struct {
 	uint16_t V_dc_cV;       /* 0.01 V/LSB */
 	int16_t  I_dc_cA;       /* 0.01 A/LSB, signed (matches PCU sign) */
 	uint16_t gen_rpm;       /* 1 rpm/LSB */
@@ -64,6 +79,8 @@ hybrid_decode_t  hybrid_proto_decode_omega_dem(const uint8_t *data, uint8_t len,
                                                hybrid_omega_dem_t *out);
 hybrid_decode_t  hybrid_proto_decode_duty_dem (const uint8_t *data, uint8_t len,
                                                hybrid_duty_dem_t  *out);
+hybrid_decode_t  hybrid_proto_decode_motor_type_cmd(const uint8_t *data, uint8_t len,
+                                                    hybrid_motor_type_cmd_t *out);
 
 void             hybrid_proto_encode_rect_state_concise(const hybrid_rect_state_t *in,
                                                         uint8_t out8[8]);
